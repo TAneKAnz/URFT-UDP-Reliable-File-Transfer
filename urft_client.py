@@ -1,11 +1,3 @@
-"""
-urft_client.py — UDP Reliable File Transfer: Sender side.
-
-Usage:
-    python urft_client.py <file_path> <server_ip> <server_port>
-
-Protocol: Selective Repeat with adaptive RTO (RFC 6298 / Karn's algorithm).
-"""
 from __future__ import annotations
 
 import os
@@ -22,13 +14,7 @@ from urft_protocol import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Adaptive RTO (RFC 6298 inspired)
-# ---------------------------------------------------------------------------
-
 class RTOEstimator:
-    """Karn's algorithm: only update from non-retransmitted packets."""
-
     def __init__(self, init_rto: float = INIT_TIMEOUT):
         self.srtt   = None
         self.rttvar = None
@@ -44,13 +30,8 @@ class RTOEstimator:
         self.rto = max(0.2, self.srtt + 4.0 * self.rttvar)
 
     def backoff(self) -> None:
-        """Exponential back-off on retransmit (capped at 16 s)."""
         self.rto = min(self.rto * 2.0, 16.0)
 
-
-# ---------------------------------------------------------------------------
-# Handshake: send META, wait for ACK(0)
-# ---------------------------------------------------------------------------
 
 def send_meta(sock: socket.socket, addr: tuple, filename: str, filesize: int,
               rto_est: RTOEstimator) -> None:
@@ -62,26 +43,22 @@ def send_meta(sock: socket.socket, addr: tuple, filename: str, filesize: int,
             raw, _ = sock.recvfrom(65535)
             pkt = unpack(raw)
             if pkt.ptype == TYPE_ACK and pkt.seq == 0:
-                return   # handshake complete
+                return
         except socket.timeout:
             rto_est.backoff()
             print(f"[META] timeout (attempt {attempt+1}), RTO={rto_est.rto:.3f}s", flush=True)
     raise RuntimeError("META handshake failed after max retries")
 
 
-# ---------------------------------------------------------------------------
-# Selective Repeat Sender
-# ---------------------------------------------------------------------------
-
 def sr_send(sock: socket.socket, addr: tuple, chunks: list[bytes],
             rto_est: RTOEstimator) -> None:
     total       = len(chunks)
-    base        = 0           # oldest unACKed seq
-    next_seq    = 0           # next seq to send
-    acked       = set()       # ACKed seq numbers
-    send_time   = {}          # seq -> time.monotonic() of last send
-    retries     = {}          # seq -> retry count
-    is_retransmit = set()     # seqs currently being retransmitted (Karn)
+    base        = 0
+    next_seq    = 0
+    acked       = set()
+    send_time   = {}
+    retries     = {}
+    is_retransmit = set()
 
     def send_chunk(seq: int, is_retry: bool = False) -> None:
         sock.sendto(pack_data(seq, chunks[seq]), addr)
@@ -92,13 +69,13 @@ def sr_send(sock: socket.socket, addr: tuple, chunks: list[bytes],
             is_retransmit.discard(seq)
 
     while base < total:
-        # Fill the window with new packets
+        # fill window
         while next_seq < total and next_seq < base + WINDOW_SIZE:
             send_chunk(next_seq)
             retries[next_seq] = 0
             next_seq += 1
 
-        # Determine the tightest deadline among in-flight packets
+        # find tightest deadline
         now     = time.monotonic()
         timeout = rto_est.rto
         for seq in range(base, min(next_seq, base + WINDOW_SIZE)):
@@ -115,28 +92,27 @@ def sr_send(sock: socket.socket, addr: tuple, chunks: list[bytes],
 
             seq = pkt.seq
             if seq < base or seq >= base + WINDOW_SIZE + total:
-                continue   # outside plausible range
+                continue
 
             if seq not in acked:
                 acked.add(seq)
-                # Update RTT only for non-retransmitted packets (Karn)
+                # update RTT only for non-retransmitted packets
                 if seq not in is_retransmit and seq in send_time:
                     rtt = time.monotonic() - send_time[seq]
                     rto_est.update(rtt)
 
-            # Advance base over consecutive ACKed packets
+            # advance base
             while base < total and base in acked:
                 base += 1
 
         except socket.timeout:
-            # Retransmit all expired in-flight packets
             now = time.monotonic()
             pre_backoff_rto = rto_est.rto
             rto_est.backoff()
             for seq in range(base, min(next_seq, base + WINDOW_SIZE)):
                 if seq not in acked:
                     elapsed = now - send_time.get(seq, 0)
-                    if elapsed >= pre_backoff_rto * 0.8:   # expired check using pre-backoff RTO
+                    if elapsed >= pre_backoff_rto * 0.8:
                         retries[seq] = retries.get(seq, 0) + 1
                         if retries[seq] > MAX_RETRIES:
                             raise RuntimeError(
@@ -146,10 +122,6 @@ def sr_send(sock: socket.socket, addr: tuple, chunks: list[bytes],
 
     print(f"[SR] all {total} chunks ACKed.", flush=True)
 
-
-# ---------------------------------------------------------------------------
-# Termination: send FIN, wait for FIN_ACK
-# ---------------------------------------------------------------------------
 
 def send_fin(sock: socket.socket, addr: tuple, total_chunks: int,
              rto_est: RTOEstimator) -> None:
@@ -169,10 +141,6 @@ def send_fin(sock: socket.socket, addr: tuple, total_chunks: int,
     raise RuntimeError("FIN handshake failed after max retries")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     if len(sys.argv) != 4:
         print("Usage: python urft_client.py <file_path> <server_ip> <server_port>")
@@ -191,7 +159,6 @@ def main() -> None:
     with open(file_path, "rb") as f:
         raw_data = f.read()
 
-    # Split into fixed-size chunks
     total_chunks = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
     chunks = [
         raw_data[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
@@ -205,11 +172,9 @@ def main() -> None:
     try:
         rto_est = RTOEstimator()
 
-        # 1. Handshake
         send_meta(sock, addr, file_path, filesize, rto_est)
         print("[META] ACK received — starting data transfer.", flush=True)
 
-        # 2. Selective Repeat data transfer
         t0 = time.monotonic()
         if total_chunks > 0:
             sr_send(sock, addr, chunks, rto_est)
@@ -219,7 +184,6 @@ def main() -> None:
             print(f"[URFT] Transfer done in {elapsed:.2f}s "
                   f"({throughput:.1f} KB/s)", flush=True)
 
-        # 3. Termination
         send_fin(sock, addr, total_chunks, rto_est)
         print("[URFT] FIN_ACK received — transfer complete.", flush=True)
 
